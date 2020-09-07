@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2016 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2019 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -481,9 +481,16 @@ pfi_instance_add(struct ifnet *ifp, int net, int flags)
 			IFA_UNLOCK(ia);
 			continue;
 		}
-		if ((flags & PFI_AFLAG_NETWORK) && af == AF_INET6 &&
+		if ((af == AF_INET6) &&
 		    IN6_IS_ADDR_LINKLOCAL(&((struct sockaddr_in6 *)
 		    (void *)ia->ifa_addr)->sin6_addr)) {
+			IFA_UNLOCK(ia);
+			continue;
+		}
+		if ((af == AF_INET6) &&
+		    (((struct in6_ifaddr *)ia)->ia6_flags &
+		    (IN6_IFF_ANYCAST | IN6_IFF_NOTREADY | IN6_IFF_DETACHED |
+		    IN6_IFF_CLAT46 | IN6_IFF_TEMPORARY | IN6_IFF_DEPRECATED))) {
 			IFA_UNLOCK(ia);
 			continue;
 		}
@@ -548,7 +555,7 @@ pfi_address_add(struct sockaddr *sa, int af, int net)
 			    "(%d/%d)\n", pfi_buffer_cnt, PFI_BUFFER_MAX);
 			return;
 		}
-		memcpy(pfi_buffer, p, pfi_buffer_cnt * sizeof(*pfi_buffer));
+		memcpy(p, pfi_buffer, pfi_buffer_max * sizeof(*pfi_buffer));
 		/* no need to zero buffer */
 		_FREE(pfi_buffer, PFI_MTYPE);
 		pfi_buffer = p;

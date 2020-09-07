@@ -185,6 +185,8 @@ bzero_phys_nc(addr64_t src64, vm_size_t bytes)
 	bzero_phys(src64, bytes);
 }
 
+extern void *secure_memset(void *, int, size_t);
+
 /* Zero bytes starting at a physical address */
 void
 bzero_phys(addr64_t src, vm_size_t bytes)
@@ -202,15 +204,14 @@ bzero_phys(addr64_t src, vm_size_t bytes)
 
 		boolean_t use_copy_window = !pmap_valid_address(src);
 		pn = (ppnum_t)(src >> PAGE_SHIFT);
+		wimg_bits = pmap_cache_attributes(pn);
 #if !defined(__ARM_COHERENT_IO__) && !__ARM_PTE_PHYSMAP__
 		count = PAGE_SIZE - offset;
-		wimg_bits = pmap_cache_attributes(pn);
 		if ((wimg_bits & VM_WIMG_MASK) != VM_WIMG_DEFAULT) {
 			use_copy_window = TRUE;
 		}
 #else
 		if (use_copy_window) {
-			wimg_bits = pmap_cache_attributes(pn);
 			count = PAGE_SIZE - offset;
 		}
 #endif
@@ -229,7 +230,17 @@ bzero_phys(addr64_t src, vm_size_t bytes)
 			count = bytes;
 		}
 
-		bzero(buf, count);
+		switch (wimg_bits & VM_WIMG_MASK) {
+		case VM_WIMG_DEFAULT:
+		case VM_WIMG_WCOMB:
+		case VM_WIMG_INNERWBACK:
+		case VM_WIMG_WTHRU:
+			bzero(buf, count);
+			break;
+		default:
+			/* 'dc zva' performed by bzero is not safe for device memory */
+			secure_memset((void*)buf, 0, count);
+		}
 
 		if (use_copy_window) {
 			pmap_unmap_cpu_windows_copy(index);
@@ -520,7 +531,7 @@ ml_phys_write_double_64(addr64_t paddr64, unsigned long long data)
 void
 setbit(int bitno, int *s)
 {
-	s[bitno / INT_SIZE] |= 1 << (bitno % INT_SIZE);
+	s[bitno / INT_SIZE] |= 1U << (bitno % INT_SIZE);
 }
 
 /*
@@ -529,7 +540,7 @@ setbit(int bitno, int *s)
 void
 clrbit(int bitno, int *s)
 {
-	s[bitno / INT_SIZE] &= ~(1 << (bitno % INT_SIZE));
+	s[bitno / INT_SIZE] &= ~(1U << (bitno % INT_SIZE));
 }
 
 /*
@@ -538,7 +549,7 @@ clrbit(int bitno, int *s)
 int
 testbit(int bitno, int *s)
 {
-	return s[bitno / INT_SIZE] & (1 << (bitno % INT_SIZE));
+	return s[bitno / INT_SIZE] & (1U << (bitno % INT_SIZE));
 }
 
 /*
@@ -765,17 +776,18 @@ ml_thread_policy(
 	//	kprintf("ml_thread_policy() unimplemented\n");
 }
 
+__dead2
 void
-panic_unimplemented()
+panic_unimplemented(void)
 {
 	panic("Not yet implemented.");
 }
 
 /* ARM64_TODO <rdar://problem/9198953> */
-void abort(void);
+void abort(void) __dead2;
 
 void
-abort()
+abort(void)
 {
 	panic("Abort.");
 }

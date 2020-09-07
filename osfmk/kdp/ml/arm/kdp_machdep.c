@@ -41,6 +41,9 @@
 #include <libkern/OSAtomic.h>
 #include <vm/vm_map.h>
 
+#if defined(HAS_APPLE_PAC)
+#include <ptrauth.h>
+#endif
 
 #define KDP_TEST_HARNESS 0
 #if KDP_TEST_HARNESS
@@ -364,7 +367,7 @@ kdp_trap(unsigned int exception, struct arm_saved_state * saved_state)
 	 * increment for both of them.
 	 */
 	if ((instr == GDB_TRAP_INSTR1) || (instr == GDB_TRAP_INSTR2)) {
-		set_saved_state_pc(saved_state, get_saved_state_pc(saved_state) + 4);
+		add_saved_state_pc(saved_state, 4);
 	}
 #else
 #error Unknown architecture.
@@ -703,6 +706,16 @@ machine_trace_thread64(thread_t thread,
 #endif
 				}
 
+#if XNU_MONITOR
+				vm_offset_t cpu_base = (vm_offset_t)pmap_stacks_start;
+				vm_offset_t cpu_top = (vm_offset_t)pmap_stacks_end;
+
+				if (((prevfp >= cpu_base) && (prevfp < cpu_top)) !=
+				    ((fp >= cpu_base) && (fp < cpu_top))) {
+					switched_stacks = TRUE;
+					break;
+				}
+#endif
 			}
 
 			if (!switched_stacks) {
@@ -722,6 +735,10 @@ machine_trace_thread64(thread_t thread,
 		}
 
 		prevlr = *(uint64_t *)kern_virt_addr;
+#if defined(HAS_APPLE_PAC)
+		/* return addresses on stack signed by arm64e ABI */
+		prevlr = (uint64_t) ptrauth_strip((void *)prevlr, ptrauth_key_return_address);
+#endif
 		if (!user_p) {
 			prevlr = VM_KERNEL_UNSLIDE(prevlr);
 		}

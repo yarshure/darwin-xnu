@@ -152,6 +152,9 @@ static _Atomic uint32_t inflight_corpses;
 unsigned long  total_corpses_created = 0;
 boolean_t corpse_enabled_config = TRUE;
 
+/* bootarg to generate corpse with size up to max_footprint_mb */
+boolean_t corpse_threshold_system_limit = FALSE;
+
 /* bootarg to turn on corpse forking for EXC_RESOURCE */
 int exc_via_corpse_forking = 1;
 
@@ -189,6 +192,11 @@ corpses_init()
 	if (PE_parse_boot_argn("corpse_for_fatal_memkill", &fatal_memkill, sizeof(fatal_memkill))) {
 		corpse_for_fatal_memkill = fatal_memkill;
 	}
+#if DEBUG || DEVELOPMENT
+	if (PE_parse_boot_argn("-corpse_threshold_system_limit", &corpse_threshold_system_limit, sizeof(corpse_threshold_system_limit))) {
+		corpse_threshold_system_limit = TRUE;
+	}
+#endif /* DEBUG || DEVELOPMENT */
 }
 
 /*
@@ -407,7 +415,7 @@ task_generate_corpse(
 	ipc_port_t corpse_port;
 	ipc_port_t old_notify;
 
-	if (task == kernel_task || task == TASK_NULL || task == current_task()) {
+	if (task == kernel_task || task == TASK_NULL) {
 		return KERN_INVALID_ARGUMENT;
 	}
 
@@ -446,7 +454,7 @@ task_generate_corpse(
 	assert(IP_NULL != corpse_port);
 
 	ip_lock(corpse_port);
-	assert(ip_active(corpse_port));
+	require_ip_active(corpse_port);
 	ipc_port_nsrequest(corpse_port, corpse_port->ip_mscount, ipc_port_make_sonce_locked(corpse_port), &old_notify);
 	/* port unlocked */
 
@@ -579,6 +587,7 @@ task_generate_corpse_internal(
 	    is_64bit_data,
 	    t_flags,
 	    TPF_NONE,
+	    TWF_NONE,
 	    &new_task);
 	if (kr != KERN_SUCCESS) {
 		goto error_task_generate_corpse;

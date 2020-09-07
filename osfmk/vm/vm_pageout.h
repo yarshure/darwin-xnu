@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2009 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2019 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -113,6 +113,9 @@ extern boolean_t vm_pressure_events_enabled;
 #define VM_REAL_FAULT_ADDR_PURGABLE             0x03
 #define VM_REAL_FAULT_ADDR_EXTERNAL             0x04
 #define VM_REAL_FAULT_ADDR_SHAREDCACHE          0x05
+#define VM_REAL_FAULT_FAST                      0x06
+#define VM_REAL_FAULT_SLOW                      0x07
+#define VM_MAP_LOOKUP_OBJECT                    0x08
 
 
 
@@ -347,7 +350,7 @@ struct upl_io_completion {
 
 
 struct upl {
-	decl_lck_mtx_data(, Lock)       /* Synchronization */
+	decl_lck_mtx_data(, Lock);      /* Synchronization */
 	int             ref_count;
 	int             ext_ref_count;
 	int             flags;
@@ -481,7 +484,7 @@ extern void vm_paging_unmap_object(
 	vm_object_t             object,
 	vm_map_offset_t         start,
 	vm_map_offset_t         end);
-decl_simple_lock_data(extern, vm_paging_lock)
+decl_simple_lock_data(extern, vm_paging_lock);
 
 /*
  * Backing store throttle when BS is exhausted
@@ -644,7 +647,7 @@ struct vm_pageout_vminfo {
 	unsigned long vm_pageout_skipped_external;
 
 	unsigned long vm_pageout_pages_evicted;
-	unsigned long vm_pageout_pages_purged;;
+	unsigned long vm_pageout_pages_purged;
 	unsigned long vm_pageout_freed_cleaned;
 	unsigned long vm_pageout_freed_speculative;
 	unsigned long vm_pageout_freed_external;

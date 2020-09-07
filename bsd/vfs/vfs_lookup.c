@@ -95,6 +95,8 @@
 #include <security/mac_framework.h>
 #endif
 
+#include <sys/paths.h>
+
 #if NAMEDRSRCFORK
 #include <sys/xattr.h>
 #endif
@@ -111,7 +113,7 @@ static int vfs_getrealpath(const char * path, char * realpath, size_t bufsize, v
 #endif
 
 static int              lookup_traverse_mountpoints(struct nameidata *ndp, struct componentname *cnp, vnode_t dp, int vbusyflags, vfs_context_t ctx);
-static int              lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx);
+static int              handle_symlink_for_namei(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx);
 static int              lookup_authorize_search(vnode_t dp, struct componentname *cnp, int dp_authorized_in_cache, vfs_context_t ctx);
 static void             lookup_consider_update_cache(vnode_t dvp, vnode_t vp, struct componentname *cnp, int nc_generation);
 static int              lookup_handle_found_vnode(struct nameidata *ndp, struct componentname *cnp, int rdonly,
@@ -165,6 +167,8 @@ namei(struct nameidata *ndp)
 {
 	struct filedesc *fdp;   /* pointer to file descriptor state */
 	struct vnode *dp;       /* the directory we are searching */
+	struct vnode *rootdir_with_usecount = NULLVP;
+	struct vnode *startdir_with_usecount = NULLVP;
 	struct vnode *usedvp = ndp->ni_dvp;  /* store pointer to vp in case we must loop due to
 	                                      *                                          heavy vnode pressure */
 	u_long cnpflags = ndp->ni_cnd.cn_flags; /* store in case we have to restore after loop */
@@ -346,16 +350,80 @@ retry_copy:
 
 	/*
 	 * determine the starting point for the translation.
+	 *
+	 * We may need to upto 2 usecounts on vnodes before starting the translation
+	 * We need to have a usecount on the root directory for the process
+	 * for the entire duration of the lookup. This is because symlink
+	 * translation can restart translation at / if a symlink is encountered.
+	 *
+	 * For the duration of this lookup at rootdir for this lookup is the one
+	 * we fetch now under the proc_fdlock even the if the proc rootdir changes
+	 * once we let go of the proc_fdlock.
+	 *
+	 * In the future we may consider holding off a chroot till we complete
+	 * in progress lookups.
+	 *
+	 * If the starting directory is not the process rootdir then we need
+	 * a usecount on the starting directory as well for the duration of the
+	 * lookup.
+	 *
+	 * Getting an addtional usecount involves first getting an iocount under
+	 * the lock that ensures that a usecount is on the directory. Once we
+	 * get an iocount we can release the lock and we will be free to get a
+	 * usecount without the vnode getting recycled. Once we get the usecount
+	 * we can release the icoount which we used to get our usecount.
 	 */
+	proc_fdlock(p);
+
 	if ((ndp->ni_rootdir = fdp->fd_rdir) == NULLVP) {
 		if (!(fdp->fd_flags & FD_CHROOT)) {
 			ndp->ni_rootdir = rootvnode;
+		} else {
+			proc_fdunlock(p);
+			/* This should be a panic */
+			printf("proc is chrooted but does not have a root directory set\n");
+			error = ENOENT;
+			goto error_out;
 		}
 	}
+
+	/*
+	 * We have the proc_fdlock here so we still have a usecount
+	 * on ndp->ni_rootdir.
+	 *
+	 * However we need to get our own usecount on it in order to
+	 * ensure that the vnode isn't recycled to something else.
+	 *
+	 * Note : It's fine if the vnode is force reclaimed but with
+	 * a usecount it won't be reused until we release the reference.
+	 *
+	 * In order to get that usecount however, we need to first
+	 * get non blocking iocount since we'll be doing this under
+	 * the proc_fdlock.
+	 */
+	if (vnode_get(ndp->ni_rootdir) != 0) {
+		proc_fdunlock(p);
+		error = ENOENT;
+		goto error_out;
+	}
+
+	proc_fdunlock(p);
+
+	/* Now we can safely get our own ref on ni_rootdir */
+	error = vnode_ref_ext(ndp->ni_rootdir, O_EVTONLY, 0);
+	vnode_put(ndp->ni_rootdir);
+	if (error) {
+		ndp->ni_rootdir = NULLVP;
+		goto error_out;
+	}
+
+	rootdir_with_usecount = ndp->ni_rootdir;
+
 	cnp->cn_nameptr = cnp->cn_pnbuf;
 
 	ndp->ni_usedvp = NULLVP;
 
+	bool dp_needs_put = false;
 	if (*(cnp->cn_nameptr) == '/') {
 		while (*(cnp->cn_nameptr) == '/') {
 			cnp->cn_nameptr++;
@@ -366,13 +434,40 @@ retry_copy:
 		dp = ndp->ni_dvp;
 		ndp->ni_usedvp = dp;
 	} else {
-		dp = vfs_context_cwd(ctx);
+		dp = vfs_context_get_cwd(ctx);
+		if (dp) {
+			dp_needs_put = true;
+		}
 	}
 
 	if (dp == NULLVP || (dp->v_lflag & VL_DEAD)) {
+		if (dp_needs_put) {
+			vnode_put(dp);
+			dp_needs_put = false;
+		}
+		dp = NULLVP;
 		error = ENOENT;
 		goto error_out;
 	}
+
+	if (dp != rootdir_with_usecount) {
+		error = vnode_ref_ext(dp, O_EVTONLY, 0);
+		if (error) {
+			if (dp_needs_put) {
+				vnode_put(dp);
+				dp_needs_put = false;
+			}
+			dp = NULLVP;
+			goto error_out;
+		}
+		startdir_with_usecount = dp;
+	}
+
+	if (dp_needs_put) {
+		vnode_put(dp);
+		dp_needs_put = false;
+	}
+
 	ndp->ni_dvp = NULLVP;
 	ndp->ni_vp  = NULLVP;
 
@@ -393,6 +488,7 @@ retry_copy:
 #endif
 
 		ndp->ni_startdir = dp;
+		dp = NULLVP;
 
 		if ((error = lookup(ndp))) {
 			goto error_out;
@@ -402,15 +498,46 @@ retry_copy:
 		 * Check for symbolic link
 		 */
 		if ((cnp->cn_flags & ISSYMLINK) == 0) {
+			if (startdir_with_usecount) {
+				vnode_rele_ext(startdir_with_usecount, O_EVTONLY, 0);
+				startdir_with_usecount = NULLVP;
+			}
+			if (rootdir_with_usecount) {
+				vnode_rele_ext(rootdir_with_usecount, O_EVTONLY, 0);
+				rootdir_with_usecount = NULLVP;
+			}
 			return 0;
 		}
 
 continue_symlink:
-		/* Gives us a new path to process, and a starting dir */
-		error = lookup_handle_symlink(ndp, &dp, ctx);
+		/*
+		 * Gives us a new path to process, and a starting dir (with an iocount).
+		 * The iocount is needed to take a usecount on the vnode returned
+		 * (if it is not a vnode we already have a usecount on).
+		 */
+		error = handle_symlink_for_namei(ndp, &dp, ctx);
 		if (error != 0) {
 			break;
 		}
+
+		if (dp == ndp->ni_rootdir && startdir_with_usecount) {
+			vnode_rele_ext(startdir_with_usecount, O_EVTONLY, 0);
+			startdir_with_usecount = NULLVP;
+		} else if (dp != startdir_with_usecount) {
+			if (startdir_with_usecount) {
+				vnode_rele_ext(startdir_with_usecount, O_EVTONLY, 0);
+				startdir_with_usecount = NULLVP;
+			}
+			error = vnode_ref_ext(dp, O_EVTONLY, 0);
+			if (error) {
+				vnode_put(dp);
+				dp = NULLVP;
+				goto error_out;
+			}
+			startdir_with_usecount = dp;
+		}
+		/* iocount not required on dp anymore */
+		vnode_put(dp);
 	}
 	/*
 	 * only come here if we fail to handle a SYMLINK...
@@ -433,6 +560,15 @@ error_out:
 	cnp->cn_pnbuf = NULL;
 	ndp->ni_vp = NULLVP;
 	ndp->ni_dvp = NULLVP;
+
+	if (startdir_with_usecount) {
+		vnode_rele_ext(startdir_with_usecount, O_EVTONLY, 0);
+		startdir_with_usecount = NULLVP;
+	}
+	if (rootdir_with_usecount) {
+		vnode_rele_ext(rootdir_with_usecount, O_EVTONLY, 0);
+		rootdir_with_usecount = NULLVP;
+	}
 
 #if CONFIG_VOLFS
 	/*
@@ -631,7 +767,21 @@ lookup_handle_rsrc_fork(vnode_t dp, struct nameidata *ndp, struct componentname 
 
 	/* Restore the truncated pathname buffer (for audits). */
 	if (ndp->ni_pathlen == 1 && ndp->ni_next[0] == '\0') {
-		ndp->ni_next[0] = '/';
+		/*
+		 * While we replaced only '/' with '\0' and would ordinarily
+		 * need to just switch that back, the buffer in which we did
+		 * this may not be what the pathname buffer is now when symlinks
+		 * are involved. If we just restore the "/" we will make the
+		 * string not terminated anymore, so be safe and restore the
+		 * entire suffix.
+		 */
+		strncpy(ndp->ni_next, _PATH_RSRCFORKSPEC, sizeof(_PATH_RSRCFORKSPEC));
+		cnp->cn_nameptr = ndp->ni_next + 1;
+		cnp->cn_namelen = sizeof(_PATH_RSRCFORKSPEC) - 1;
+		ndp->ni_next += cnp->cn_namelen;
+		if (ndp->ni_next[0] != '\0') {
+			panic("Incorrect termination of path in %s", __FUNCTION__);
+		}
 	}
 	cnp->cn_flags  &= ~MAKEENTRY;
 
@@ -1514,10 +1664,10 @@ out:
 
 /*
  * Takes ni_vp and ni_dvp non-NULL.  Returns with *new_dp set to the location
- * at which to start a lookup with a resolved path, and all other iocounts dropped.
+ * at which to start a lookup with a resolved path and with an iocount.
  */
 static int
-lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx)
+handle_symlink_for_namei(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx)
 {
 	int error;
 	char *cp;               /* pointer into pathname argument */
@@ -1535,6 +1685,7 @@ lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx)
 	struct componentname *cnp = &ndp->ni_cnd;
 	vnode_t dp;
 	char *tmppn;
+	u_int rsrclen = (cnp->cn_flags & CN_WANTSRSRCFORK) ? sizeof(_PATH_RSRCFORKSPEC) : 0;
 
 	if (ndp->ni_loopcnt++ >= MAXSYMLINKS) {
 		return ELOOP;
@@ -1577,7 +1728,7 @@ lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx)
 	 * is only 1024.
 	 */
 	linklen = MAXPATHLEN - (u_int)uio_resid(auio);
-	if (linklen + ndp->ni_pathlen > MAXPATHLEN) {
+	if (linklen + ndp->ni_pathlen + rsrclen > MAXPATHLEN) {
 		if (need_newpathbuf) {
 			FREE_ZONE(cp, MAXPATHLEN, M_NAMEI);
 		}
@@ -1607,17 +1758,18 @@ lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx)
 	/*
 	 * starting point for 'relative'
 	 * symbolic link path
+	 *
+	 * If the starting point is not the root we have to return an iocounted
+	 * dp to namei so we don't release the icoount here.
 	 */
 	dp = ndp->ni_dvp;
+	ndp->ni_dvp = NULLVP;
 
 	/*
 	 * get rid of references returned via 'lookup'
 	 */
 	vnode_put(ndp->ni_vp);
-	vnode_put(ndp->ni_dvp); /* ALWAYS have a dvp for a symlink */
-
 	ndp->ni_vp = NULLVP;
-	ndp->ni_dvp = NULLVP;
 
 	/*
 	 * Check if symbolic link restarts us at the root
@@ -1627,9 +1779,20 @@ lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, vfs_context_t ctx)
 			cnp->cn_nameptr++;
 			ndp->ni_pathlen--;
 		}
+		vnode_put(dp);
 		if ((dp = ndp->ni_rootdir) == NULLVP) {
 			return ENOENT;
 		}
+		if (vnode_get(dp) != 0) {
+			return ENOENT;
+		}
+	}
+
+	if (dp == NULLVP || (dp->v_lflag & VL_DEAD)) {
+		if (dp) {
+			vnode_put(dp);
+		}
+		return ENOENT;
 	}
 
 	*new_dp = dp;
@@ -1848,7 +2011,7 @@ kdebug_vfs_lookup(long *dbg_parms, int dbg_namelen, void *dp, uint32_t flags)
 
 void
 kdebug_lookup_gen_events(long *dbg_parms, int dbg_namelen, void *dp,
-    boolean_t lookup)
+    bool lookup)
 {
 	kdebug_vfs_lookup(dbg_parms, dbg_namelen, dp,
 	    lookup ? KDBG_VFS_LOOKUP_FLAG_LOOKUP : 0);
@@ -1972,7 +2135,24 @@ vfs_getrealpath(const char * path, char * realpath, size_t bufsize, vfs_context_
 
 	/* Get the target vnode. */
 	if (ino == 2) {
-		error = VFS_ROOT(mp, &vp, ctx);
+		struct vfs_attr vfsattr;
+		int use_vfs_root = TRUE;
+
+		VFSATTR_INIT(&vfsattr);
+		VFSATTR_WANTED(&vfsattr, f_capabilities);
+		if (vfs_getattr(mp, &vfsattr, vfs_context_kernel()) == 0 &&
+		    VFSATTR_IS_SUPPORTED(&vfsattr, f_capabilities)) {
+			if ((vfsattr.f_capabilities.capabilities[VOL_CAPABILITIES_FORMAT] & VOL_CAP_FMT_VOL_GROUPS) &&
+			    (vfsattr.f_capabilities.valid[VOL_CAPABILITIES_FORMAT] & VOL_CAP_FMT_VOL_GROUPS)) {
+				use_vfs_root = FALSE;
+			}
+		}
+
+		if (use_vfs_root) {
+			error = VFS_ROOT(mp, &vp, ctx);
+		} else {
+			error = VFS_VGET(mp, ino, &vp, ctx);
+		}
 	} else {
 		error = VFS_VGET(mp, ino, &vp, ctx);
 	}

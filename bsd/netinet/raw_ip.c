@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2018 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2019 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -193,7 +193,14 @@ rip_init(struct protosw *pp, struct domain *dp)
 	in_pcbinfo_attach(&ripcbinfo);
 }
 
-static struct   sockaddr_in ripsrc = { sizeof(ripsrc), AF_INET, 0, {0}, {0, 0, 0, 0, 0, 0, 0, 0, } };
+static struct   sockaddr_in ripsrc = {
+	.sin_len = sizeof(ripsrc),
+	.sin_family = AF_INET,
+	.sin_port = 0,
+	.sin_addr = { .s_addr = 0 },
+	.sin_zero = {0, 0, 0, 0, 0, 0, 0, 0, }
+};
+
 /*
  * Setup generic address and protocol structures
  * for raw_input routine, then pass them along with
@@ -365,6 +372,7 @@ rip_output(
 	int flags = (so->so_options & SO_DONTROUTE) | IP_ALLOWBROADCAST;
 	struct ip_out_args ipoa;
 	struct ip_moptions *imo;
+	int tos = IPTOS_UNSPEC;
 	int error = 0;
 
 	bzero(&ipoa, sizeof(ipoa));
@@ -376,6 +384,7 @@ rip_output(
 
 
 	if (control != NULL) {
+		tos = so_tos_from_control(control);
 		sotc = so_tc_from_control(control, &netsvctype);
 
 		m_freem(control);
@@ -410,6 +419,9 @@ rip_output(
 	if (INP_NO_EXPENSIVE(inp)) {
 		ipoa.ipoa_flags |=  IPOAF_NO_EXPENSIVE;
 	}
+	if (INP_NO_CONSTRAINED(inp)) {
+		ipoa.ipoa_flags |=  IPOAF_NO_CONSTRAINED;
+	}
 	if (INP_AWDL_UNRESTRICTED(inp)) {
 		ipoa.ipoa_flags |=  IPOAF_AWDL_UNRESTRICTED;
 	}
@@ -434,7 +446,11 @@ rip_output(
 			return ENOBUFS;
 		}
 		ip = mtod(m, struct ip *);
-		ip->ip_tos = inp->inp_ip_tos;
+		if (tos != IPTOS_UNSPEC) {
+			ip->ip_tos = (uint8_t)(tos & IPTOS_MASK);
+		} else {
+			ip->ip_tos = inp->inp_ip_tos;
+		}
 		ip->ip_off = 0;
 		ip->ip_p = inp->inp_ip_p;
 		ip->ip_len = m->m_pkthdr.len;
@@ -609,11 +625,11 @@ rip_output(
 	}
 
 	/*
-	 * If output interface was cellular/expensive, and this socket is
+	 * If output interface was cellular/expensive/constrained, and this socket is
 	 * denied access to it, generate an event.
 	 */
 	if (error != 0 && (ipoa.ipoa_retflags & IPOARF_IFDENIED) &&
-	    (INP_NO_CELLULAR(inp) || INP_NO_EXPENSIVE(inp))) {
+	    (INP_NO_CELLULAR(inp) || INP_NO_EXPENSIVE(inp) || INP_NO_CONSTRAINED(inp))) {
 		soevent(so, (SO_FILT_HINT_LOCKED | SO_FILT_HINT_IFDENIED));
 	}
 

@@ -100,6 +100,8 @@
 #include <net/route.h>
 #include <netinet/in_pcb.h>
 
+#include <os/ptrtools.h>
+
 #if CONFIG_MACF_SOCKET_SUBSET
 #include <security/mac_framework.h>
 #endif /* MAC_SOCKET_SUBSET */
@@ -1012,6 +1014,12 @@ connectitx(struct socket *so, struct sockaddr *src,
 	if ((error = mac_socket_check_connect(kauth_cred_get(), so, dst)) != 0) {
 		return error;
 	}
+
+	if (auio != NULL) {
+		if ((error = mac_socket_check_send(kauth_cred_get(), so, dst)) != 0) {
+			return error;
+		}
+	}
 #endif /* MAC_SOCKET_SUBSET */
 
 	socket_lock(so, 1);
@@ -1382,6 +1390,11 @@ sendto_nocancel(struct proc *p,
 	KERNEL_DEBUG(DBG_FNC_SENDTO | DBG_FUNC_START, 0, 0, 0, 0, 0);
 	AUDIT_ARG(fd, uap->s);
 
+	if (uap->flags & MSG_SKIPCFIL) {
+		error = EPERM;
+		goto done;
+	}
+
 	auio = uio_create(1, 0,
 	    (IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32),
 	    UIO_WRITE);
@@ -1451,6 +1464,12 @@ sendmsg_nocancel(struct proc *p, struct sendmsg_nocancel_args *uap,
 
 	KERNEL_DEBUG(DBG_FNC_SENDMSG | DBG_FUNC_START, 0, 0, 0, 0, 0);
 	AUDIT_ARG(fd, uap->s);
+
+	if (uap->flags & MSG_SKIPCFIL) {
+		error = EPERM;
+		goto done;
+	}
+
 	if (IS_64BIT_PROCESS(p)) {
 		msghdrp = (caddr_t)&msg64;
 		size_of_msghdr = sizeof(msg64);
@@ -1563,6 +1582,11 @@ sendmsg_x(struct proc *p, struct sendmsg_x_args *uap, user_ssize_t *retval)
 	int has_addr_or_ctl = 0;
 
 	KERNEL_DEBUG(DBG_FNC_SENDMSG_X | DBG_FUNC_START, 0, 0, 0, 0, 0);
+
+	if (uap->flags & MSG_SKIPCFIL) {
+		error = EPERM;
+		goto out;
+	}
 
 	error = file_socket(uap->s, &so);
 	if (error) {
@@ -1816,8 +1840,8 @@ copyout_control(struct proc *p, struct mbuf *m, user_addr_t control,
 				if (proc_is64bit(p)) {
 					struct user64_timeval *tv64 = (struct user64_timeval *)(void *)CMSG_DATA(tmp_cp);
 
-					tv64->tv_sec = tv->tv_sec;
-					tv64->tv_usec = tv->tv_usec;
+					os_unaligned_deref(&tv64->tv_sec) = tv->tv_sec;
+					os_unaligned_deref(&tv64->tv_usec) = tv->tv_usec;
 
 					tmp_cp->cmsg_len = CMSG_LEN(sizeof(struct user64_timeval));
 					tmp_space = CMSG_SPACE(sizeof(struct user64_timeval));
@@ -3440,9 +3464,11 @@ sendfile(struct proc *p, struct sendfile_args *uap, __unused int *retval)
 	/*
 	 * Get number of bytes to send
 	 * Should it applies to size of header and trailer?
-	 * JMM - error handling?
 	 */
-	copyin(uap->nbytes, &nbytes, sizeof(off_t));
+	error = copyin(uap->nbytes, &nbytes, sizeof(off_t));
+	if (error) {
+		goto done2;
+	}
 
 	/*
 	 * If specified, get the pointer to the sf_hdtr struct for

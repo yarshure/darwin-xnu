@@ -124,6 +124,8 @@
 
 #define IPLEN_FLIPPED
 
+extern lck_mtx_t  *sadb_mutex;
+
 #if INET
 void
 ah4_input(struct mbuf *m, int off)
@@ -230,7 +232,7 @@ ah4_input(struct mbuf *m, int off)
 		 */
 		if (siz1 < siz) {
 			ipseclog((LOG_NOTICE, "sum length too short in IPv4 AH input "
-			    "(%lu, should be at least %lu): %s\n",
+			    "(%u, should be at least %u): %s\n",
 			    (u_int32_t)siz1, (u_int32_t)siz,
 			    ipsec4_logpacketstr(ip, spi)));
 			IPSEC_STAT_INCREMENT(ipsecstat.in_inval);
@@ -238,7 +240,7 @@ ah4_input(struct mbuf *m, int off)
 		}
 		if ((ah->ah_len << 2) - sizoff != siz1) {
 			ipseclog((LOG_NOTICE, "sum length mismatch in IPv4 AH input "
-			    "(%d should be %lu): %s\n",
+			    "(%d should be %u): %s\n",
 			    (ah->ah_len << 2) - sizoff, (u_int32_t)siz1,
 			    ipsec4_logpacketstr(ip, spi)));
 			IPSEC_STAT_INCREMENT(ipsecstat.in_inval);
@@ -263,8 +265,8 @@ ah4_input(struct mbuf *m, int off)
 	/*
 	 * check for sequence number.
 	 */
-	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay) {
-		if (ipsec_chkreplay(ntohl(((struct newah *)ah)->ah_seq), sav)) {
+	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay[0] != NULL) {
+		if (ipsec_chkreplay(ntohl(((struct newah *)ah)->ah_seq), sav, 0)) {
 			; /*okey*/
 		} else {
 			IPSEC_STAT_INCREMENT(ipsecstat.in_ahreplay);
@@ -386,8 +388,8 @@ ah4_input(struct mbuf *m, int off)
 	/*
 	 * update sequence number.
 	 */
-	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay) {
-		if (ipsec_updatereplay(ntohl(((struct newah *)ah)->ah_seq), sav)) {
+	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay[0] != NULL) {
+		if (ipsec_updatereplay(ntohl(((struct newah *)ah)->ah_seq), sav, 0)) {
 			IPSEC_STAT_INCREMENT(ipsecstat.in_ahreplay);
 			goto fail;
 		}
@@ -499,9 +501,18 @@ ah4_input(struct mbuf *m, int off)
 			IFA_REMREF(ifa);
 		}
 
-		// Input via IPSec interface
-		if (sav->sah->ipsec_if != NULL) {
-			if (ipsec_inject_inbound_packet(sav->sah->ipsec_if, m) == 0) {
+		// Input via IPsec interface
+		lck_mtx_lock(sadb_mutex);
+		ifnet_t ipsec_if = sav->sah->ipsec_if;
+		if (ipsec_if != NULL) {
+			// If an interface is found, add a reference count before dropping the lock
+			ifnet_reference(ipsec_if);
+		}
+		lck_mtx_unlock(sadb_mutex);
+		if (ipsec_if != NULL) {
+			errno_t inject_error = ipsec_inject_inbound_packet(ipsec_if, m);
+			ifnet_release(ipsec_if);
+			if (inject_error == 0) {
 				m = NULL;
 				goto done;
 			} else {
@@ -555,13 +566,22 @@ ah4_input(struct mbuf *m, int off)
 		    struct ip *, ip, struct ip6_hdr *, NULL);
 
 		if (nxt != IPPROTO_DONE) {
-			// Input via IPSec interface
-			if (sav->sah->ipsec_if != NULL) {
+			// Input via IPsec interface
+			lck_mtx_lock(sadb_mutex);
+			ifnet_t ipsec_if = sav->sah->ipsec_if;
+			if (ipsec_if != NULL) {
+				// If an interface is found, add a reference count before dropping the lock
+				ifnet_reference(ipsec_if);
+			}
+			lck_mtx_unlock(sadb_mutex);
+			if (ipsec_if != NULL) {
 				ip->ip_len = htons(ip->ip_len + hlen);
 				ip->ip_off = htons(ip->ip_off);
 				ip->ip_sum = 0;
 				ip->ip_sum = ip_cksum_hdr_in(m, hlen);
-				if (ipsec_inject_inbound_packet(sav->sah->ipsec_if, m) == 0) {
+				errno_t inject_error = ipsec_inject_inbound_packet(ipsec_if, m);
+				ifnet_release(ipsec_if);
+				if (inject_error == 0) {
 					m = NULL;
 					goto done;
 				} else {
@@ -688,7 +708,7 @@ ah6_input(struct mbuf **mp, int *offp, int proto)
 		 */
 		if (siz1 < siz) {
 			ipseclog((LOG_NOTICE, "sum length too short in IPv6 AH input "
-			    "(%lu, should be at least %lu): %s\n",
+			    "(%u, should be at least %u): %s\n",
 			    (u_int32_t)siz1, (u_int32_t)siz,
 			    ipsec6_logpacketstr(ip6, spi)));
 			IPSEC_STAT_INCREMENT(ipsec6stat.in_inval);
@@ -696,7 +716,7 @@ ah6_input(struct mbuf **mp, int *offp, int proto)
 		}
 		if ((ah->ah_len << 2) - sizoff != siz1) {
 			ipseclog((LOG_NOTICE, "sum length mismatch in IPv6 AH input "
-			    "(%d should be %lu): %s\n",
+			    "(%d should be %u): %s\n",
 			    (ah->ah_len << 2) - sizoff, (u_int32_t)siz1,
 			    ipsec6_logpacketstr(ip6, spi)));
 			IPSEC_STAT_INCREMENT(ipsec6stat.in_inval);
@@ -709,8 +729,8 @@ ah6_input(struct mbuf **mp, int *offp, int proto)
 	/*
 	 * check for sequence number.
 	 */
-	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay) {
-		if (ipsec_chkreplay(ntohl(((struct newah *)ah)->ah_seq), sav)) {
+	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay[0] != NULL) {
+		if (ipsec_chkreplay(ntohl(((struct newah *)ah)->ah_seq), sav, 0)) {
 			; /*okey*/
 		} else {
 			IPSEC_STAT_INCREMENT(ipsec6stat.in_ahreplay);
@@ -815,8 +835,8 @@ ah6_input(struct mbuf **mp, int *offp, int proto)
 	/*
 	 * update sequence number.
 	 */
-	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay) {
-		if (ipsec_updatereplay(ntohl(((struct newah *)ah)->ah_seq), sav)) {
+	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay[0] != NULL) {
+		if (ipsec_updatereplay(ntohl(((struct newah *)ah)->ah_seq), sav, 0)) {
 			IPSEC_STAT_INCREMENT(ipsec6stat.in_ahreplay);
 			goto fail;
 		}
@@ -907,9 +927,18 @@ ah6_input(struct mbuf **mp, int *offp, int proto)
 			IFA_REMREF(ifa);
 		}
 
-		// Input via IPSec interface
-		if (sav->sah->ipsec_if != NULL) {
-			if (ipsec_inject_inbound_packet(sav->sah->ipsec_if, m) == 0) {
+		// Input via IPsec interface
+		lck_mtx_lock(sadb_mutex);
+		ifnet_t ipsec_if = sav->sah->ipsec_if;
+		if (ipsec_if != NULL) {
+			// If an interface is found, add a reference count before dropping the lock
+			ifnet_reference(ipsec_if);
+		}
+		lck_mtx_unlock(sadb_mutex);
+		if (ipsec_if != NULL) {
+			errno_t inject_error = ipsec_inject_inbound_packet(ipsec_if, m);
+			ifnet_release(ipsec_if);
+			if (inject_error == 0) {
 				m = NULL;
 				nxt = IPPROTO_DONE;
 				goto done;
@@ -955,9 +984,18 @@ ah6_input(struct mbuf **mp, int *offp, int proto)
 			goto fail;
 		}
 
-		// Input via IPSec interface
-		if (sav->sah->ipsec_if != NULL) {
-			if (ipsec_inject_inbound_packet(sav->sah->ipsec_if, m) == 0) {
+		// Input via IPsec interface
+		lck_mtx_lock(sadb_mutex);
+		ifnet_t ipsec_if = sav->sah->ipsec_if;
+		if (ipsec_if != NULL) {
+			// If an interface is found, add a reference count before dropping the lock
+			ifnet_reference(ipsec_if);
+		}
+		lck_mtx_unlock(sadb_mutex);
+		if (ipsec_if != NULL) {
+			errno_t inject_error = ipsec_inject_inbound_packet(ipsec_if, m);
+			ifnet_release(ipsec_if);
+			if (inject_error == 0) {
 				m = NULL;
 				nxt = IPPROTO_DONE;
 				goto done;

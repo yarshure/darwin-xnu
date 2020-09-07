@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2019 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -80,12 +80,6 @@
 
 #include <sys/file_internal.h>
 
-/*
- * This variable controls the maximum number of processes that will
- * be checked in doing deadlock detection.
- */
-static int maxlockdepth = MAXDEPTH;
-
 #if (DEVELOPMENT || DEBUG)
 #define LOCKF_DEBUGGING 1
 #endif
@@ -99,6 +93,7 @@ void lf_printlist(const char *tag, struct lockf *lock);
 #define LF_DBG_LIST     (1 << 1)        /* split, coalesce */
 #define LF_DBG_IMPINH   (1 << 2)        /* importance inheritance */
 #define LF_DBG_TRACE    (1 << 3)        /* errors, exit */
+#define LF_DBG_DEADLOCK (1 << 4)        /* deadlock detection */
 
 static int      lockf_debug = 0;        /* was 2, could be 3 ;-) */
 SYSCTL_INT(_debug, OID_AUTO, lockf_debug, CTLFLAG_RW | CTLFLAG_LOCKED, &lockf_debug, 0, "");
@@ -109,10 +104,16 @@ SYSCTL_INT(_debug, OID_AUTO, lockf_debug, CTLFLAG_RW | CTLFLAG_LOCKED, &lockf_de
  */
 #define LOCKF_DEBUG(mask, ...)                                  \
 	do {                                                    \
-	        if( !(mask) || ((mask) & lockf_debug)) {        \
+	        if (!(mask) || ((mask) & lockf_debug)) {        \
+	                printf("%s>", __FUNCTION__);            \
 	                printf(__VA_ARGS__);                    \
 	        }                                               \
 	} while(0)
+
+#define LOCKF_DEBUGP(mask)                                      \
+	({                                                      \
+	        ((mask) & lockf_debug);                         \
+	})
 #else   /* !LOCKF_DEBUGGING */
 #define LOCKF_DEBUG(mask, ...)          /* mask */
 #endif  /* !LOCKF_DEBUGGING */
@@ -151,6 +152,16 @@ static void      lf_drop_assertion(struct lockf *);
 static void      lf_boost_blocking_proc(struct lockf *, struct lockf *);
 static void      lf_adjust_assertion(struct lockf *block);
 #endif /* IMPORTANCE_INHERITANCE */
+
+static lck_mtx_t lf_dead_lock;
+static lck_grp_t *lf_dead_lock_grp;
+
+void
+lf_init(void)
+{
+	lf_dead_lock_grp = lck_grp_alloc_init("lf_dead_lock", LCK_GRP_ATTR_NULL);
+	lck_mtx_init(&lf_dead_lock, lf_dead_lock_grp, LCK_ATTR_NULL);
+}
 
 /*
  * lf_advlock
@@ -497,17 +508,18 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 	struct lockf *block;
 	struct lockf **head = lock->lf_head;
 	struct lockf **prev, *overlap, *ltmp;
-	static char lockstr[] = "lockf";
+	static const char lockstr[] = "lockf";
 	int priority, needtolink, error;
 	struct vnode *vp = lock->lf_vnode;
 	overlap_t ovcase;
 
 #ifdef LOCKF_DEBUGGING
-	if (lockf_debug & LF_DBG_LOCKOP) {
+	if (LOCKF_DEBUGP(LF_DBG_LOCKOP)) {
 		lf_print("lf_setlock", lock);
 		lf_printlist("lf_setlock(in)", lock);
 	}
 #endif /* LOCKF_DEBUGGING */
+	LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p Looking for deadlock, vnode %p\n", lock, lock->lf_vnode);
 
 	/*
 	 * Set the priority
@@ -517,6 +529,7 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 		priority += 4;
 	}
 	priority |= PCATCH;
+scan:
 	/*
 	 * Scan lock list for this file looking for locks that would block us.
 	 */
@@ -530,6 +543,8 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 			return EAGAIN;
 		}
 
+		LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p found blocking lock %p\n", lock, block);
+
 		/*
 		 * We are blocked. Since flock style locks cover
 		 * the whole file, there is no chance for deadlock.
@@ -541,45 +556,96 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 		 *
 		 * Deadlock detection is done by looking through the
 		 * wait channels to see if there are any cycles that
-		 * involve us. MAXDEPTH is set just to make sure we
-		 * do not go off into neverland.
+		 * involve us.
 		 */
 		if ((lock->lf_flags & F_POSIX) &&
 		    (block->lf_flags & F_POSIX)) {
-			struct proc *wproc, *bproc;
-			struct uthread *ut;
-			struct lockf *waitblock;
-			int i = 0;
+			lck_mtx_lock(&lf_dead_lock);
 
-			/* The block is waiting on something */
-			wproc = block->lf_owner;
+			/* The blocked process is waiting on something */
+			struct proc *wproc = block->lf_owner;
 			proc_lock(wproc);
+
+			LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p owned by pid %d\n", lock, proc_pid(wproc));
+
+			struct uthread *ut;
 			TAILQ_FOREACH(ut, &wproc->p_uthlist, uu_list) {
 				/*
-				 * While the thread is asleep (uu_wchan != 0)
-				 * in this code (uu_wmesg == lockstr)
-				 * and we have not exceeded the maximum cycle
-				 * depth (i < maxlockdepth), then check for a
-				 * cycle to see if the lock is blocked behind
+				 * If the thread is (a) asleep (uu_wchan != 0)
+				 * and (b) in this code (uu_wmesg == lockstr)
+				 * then check to see if the lock is blocked behind
 				 * someone blocked behind us.
+				 *
+				 * Note: (i) vp->v_lock is held, preventing other
+				 * threads from mutating the blocking list for our vnode.
+				 * and (ii) the proc_lock is held i.e the thread list
+				 * is stable.
+				 *
+				 * HOWEVER some thread in wproc might be sleeping on a lockf
+				 * structure for a different vnode, and be woken at any
+				 * time. Thus the waitblock list could mutate while
+				 * it's being inspected by this thread, and what
+				 * ut->uu_wchan was just pointing at could even be freed.
+				 *
+				 * Nevertheless this is safe here because of lf_dead_lock; if
+				 * any thread blocked with uu_wmesg == lockstr wakes (see below)
+				 * it will try to acquire lf_dead_lock which is already held
+				 * here. Holding that lock prevents the lockf structure being
+				 * pointed at by ut->uu_wchan from going away. Thus the vnode
+				 * involved can be found and locked, and the corresponding
+				 * blocking chain can then be examined safely.
 				 */
-				while (((waitblock = (struct lockf *)ut->uu_wchan) != NULL) &&
-				    ut->uu_wmesg == lockstr &&
-				    (i++ < maxlockdepth)) {
-					waitblock = (struct lockf *)ut->uu_wchan;
+				const struct lockf *waitblock = (const void *)ut->uu_wchan;
+				if ((waitblock != NULL) && (ut->uu_wmesg == lockstr)) {
+					LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p which is also blocked on lock %p vnode %p\n", lock, waitblock, waitblock->lf_vnode);
+
+					vnode_t othervp = NULL;
+					if (waitblock->lf_vnode != vp) {
+						/*
+						 * This thread in wproc is waiting for a lock
+						 * on a different vnode; grab the lock on it
+						 * that protects lf_next while we examine it.
+						 */
+						othervp = waitblock->lf_vnode;
+						if (!lck_mtx_try_lock(&othervp->v_lock)) {
+							/*
+							 * avoid kernel deadlock: drop all
+							 * locks, pause for a bit to let the
+							 * other thread do what it needs to do,
+							 * then (because we drop and retake
+							 * v_lock) retry the scan.
+							 */
+							proc_unlock(wproc);
+							lck_mtx_unlock(&lf_dead_lock);
+							static struct timespec ts = {
+								.tv_sec = 0,
+								.tv_nsec = 2 * NSEC_PER_MSEC,
+							};
+							static const char pausestr[] = "lockf:pause";
+							(void) msleep(lock, &vp->v_lock, priority, pausestr, &ts);
+							LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p contention for vp %p => restart\n", lock, othervp);
+							goto scan;
+						}
+					}
+
 					/*
 					 * Get the lock blocking the lock
 					 * which would block us, and make
-					 * certain it hasn't come unblocked
+					 * certain it hasn't become unblocked
 					 * (been granted, e.g. between the time
 					 * we called lf_getblock, and the time
 					 * we successfully acquired the
 					 * proc_lock).
 					 */
-					waitblock = waitblock->lf_next;
-					if (waitblock == NULL) {
-						break;
+					const struct lockf *nextblock = waitblock->lf_next;
+					if (nextblock == NULL) {
+						if (othervp) {
+							lck_mtx_unlock(&othervp->v_lock);
+						}
+						LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p with waitblock %p and no lf_next; othervp %p\n", lock, waitblock, othervp);
+						continue;
 					}
+					LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p which is also blocked on lock %p vnode %p\n", lock, nextblock, nextblock->lf_vnode);
 
 					/*
 					 * Make sure it's an advisory range
@@ -587,8 +653,11 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 					 * if we mix lock types, it's our own
 					 * fault.
 					 */
-					if ((waitblock->lf_flags & F_POSIX) == 0) {
-						break;
+					if ((nextblock->lf_flags & F_POSIX) == 0) {
+						if (othervp) {
+							lck_mtx_unlock(&othervp->v_lock);
+						}
+						continue;
 					}
 
 					/*
@@ -597,15 +666,25 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 					 * getting the requested lock, then we
 					 * would deadlock, so error out.
 					 */
-					bproc = waitblock->lf_owner;
-					if (bproc == lock->lf_owner) {
+					struct proc *bproc = nextblock->lf_owner;
+					const boolean_t deadlocked = bproc == lock->lf_owner;
+
+					if (othervp) {
+						lck_mtx_unlock(&othervp->v_lock);
+					}
+					LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p owned by pid %d\n", lock, proc_pid(bproc));
+					if (deadlocked) {
+						LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p which is me, so EDEADLK\n", lock);
 						proc_unlock(wproc);
+						lck_mtx_unlock(&lf_dead_lock);
 						FREE(lock, M_LOCKF);
 						return EDEADLK;
 					}
 				}
+				LOCKF_DEBUG(LF_DBG_DEADLOCK, "lock %p bottom of thread loop\n", lock);
 			}
 			proc_unlock(wproc);
+			lck_mtx_unlock(&lf_dead_lock);
 		}
 
 		/*
@@ -658,14 +737,26 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 #endif /* IMPORTANCE_INHERITANCE */
 
 #ifdef LOCKF_DEBUGGING
-		if (lockf_debug & LF_DBG_LOCKOP) {
+		if (LOCKF_DEBUGP(LF_DBG_LOCKOP)) {
 			lf_print("lf_setlock: blocking on", block);
 			lf_printlist("lf_setlock(block)", block);
 		}
 #endif /* LOCKF_DEBUGGING */
 		DTRACE_FSINFO(advlock__wait, vnode_t, vp);
 
-		error = msleep(lock, &vp->v_lock, priority, lockstr, timeout);
+		if (lock->lf_flags & F_POSIX) {
+			error = msleep(lock, &vp->v_lock, priority, lockstr, timeout);
+			/*
+			 * Ensure that 'lock' doesn't get mutated or freed if a
+			 * wakeup occurs while hunting for deadlocks (and holding
+			 * lf_dead_lock - see above)
+			 */
+			lck_mtx_lock(&lf_dead_lock);
+			lck_mtx_unlock(&lf_dead_lock);
+		} else {
+			static const char lockstr_np[] = "lockf:np";
+			error = msleep(lock, &vp->v_lock, priority, lockstr_np, timeout);
+		}
 
 		if (error == 0 && (lock->lf_flags & F_ABORT) != 0) {
 			error = EBADF;
@@ -853,7 +944,7 @@ lf_setlock(struct lockf *lock, struct timespec *timeout)
 	/* Coalesce adjacent locks with identical attributes */
 	lf_coalesce_adjacent(lock);
 #ifdef LOCKF_DEBUGGING
-	if (lockf_debug & LF_DBG_LOCKOP) {
+	if (LOCKF_DEBUGP(LF_DBG_LOCKOP)) {
 		lf_print("lf_setlock: got the lock", lock);
 		lf_printlist("lf_setlock(out)", lock);
 	}
@@ -893,7 +984,7 @@ lf_clearlock(struct lockf *unlock)
 	if (unlock->lf_type != F_UNLCK) {
 		panic("lf_clearlock: bad type");
 	}
-	if (lockf_debug & LF_DBG_LOCKOP) {
+	if (LOCKF_DEBUGP(LF_DBG_LOCKOP)) {
 		lf_print("lf_clearlock", unlock);
 	}
 #endif /* LOCKF_DEBUGGING */
@@ -952,7 +1043,7 @@ lf_clearlock(struct lockf *unlock)
 		break;
 	}
 #ifdef LOCKF_DEBUGGING
-	if (lockf_debug & LF_DBG_LOCKOP) {
+	if (LOCKF_DEBUGP(LF_DBG_LOCKOP)) {
 		lf_printlist("lf_clearlock", unlock);
 	}
 #endif /* LOCKF_DEBUGGING */
@@ -988,7 +1079,7 @@ lf_getlock(struct lockf *lock, struct flock *fl, pid_t matchpid)
 	struct lockf *block;
 
 #ifdef LOCKF_DEBUGGING
-	if (lockf_debug & LF_DBG_LOCKOP) {
+	if (LOCKF_DEBUGP(LF_DBG_LOCKOP)) {
 		lf_print("lf_getlock", lock);
 	}
 #endif /* LOCKF_DEBUGGING */
@@ -1121,7 +1212,7 @@ lf_findoverlap(struct lockf *lf, struct lockf *lock, int type,
 		return 0;
 	}
 #ifdef LOCKF_DEBUGGING
-	if (lockf_debug & LF_DBG_LIST) {
+	if (LOCKF_DEBUGP(LF_DBG_LIST)) {
 		lf_print("lf_findoverlap: looking for overlap in", lock);
 	}
 #endif /* LOCKF_DEBUGGING */
@@ -1153,7 +1244,7 @@ lf_findoverlap(struct lockf *lf, struct lockf *lock, int type,
 		}
 
 #ifdef LOCKF_DEBUGGING
-		if (lockf_debug & LF_DBG_LIST) {
+		if (LOCKF_DEBUGP(LF_DBG_LIST)) {
 			lf_print("\tchecking", lf);
 		}
 #endif /* LOCKF_DEBUGGING */
@@ -1238,7 +1329,7 @@ lf_split(struct lockf *lock1, struct lockf *lock2)
 	struct lockf *splitlock;
 
 #ifdef LOCKF_DEBUGGING
-	if (lockf_debug & LF_DBG_LIST) {
+	if (LOCKF_DEBUGP(LF_DBG_LIST)) {
 		lf_print("lf_split", lock1);
 		lf_print("splitting from", lock2);
 	}
@@ -1314,7 +1405,7 @@ lf_wakelock(struct lockf *listhead, boolean_t force_all)
 
 		wakelock->lf_next = NOLOCKF;
 #ifdef LOCKF_DEBUGGING
-		if (lockf_debug & LF_DBG_LOCKOP) {
+		if (LOCKF_DEBUGP(LF_DBG_LOCKOP)) {
 			lf_print("lf_wakelock: awakening", wakelock);
 		}
 #endif /* LOCKF_DEBUGGING */

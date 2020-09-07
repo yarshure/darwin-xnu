@@ -100,7 +100,6 @@
 
 extern void kprintf_break_lock(void);
 extern void kprint_state(x86_saved_state64_t *saved_state);
-void panic_64(x86_saved_state_t *, int, const char *, boolean_t);
 
 extern volatile int panic_double_fault_cpu;
 
@@ -109,7 +108,7 @@ extern volatile int panic_double_fault_cpu;
 /*
  * K64 debug - fatal handler for debug code in the trap vectors.
  */
-extern void
+extern void __dead2
 panic_idt64(x86_saved_state_t *rsp);
 void
 panic_idt64(x86_saved_state_t *rsp)
@@ -120,7 +119,8 @@ panic_idt64(x86_saved_state_t *rsp)
 #endif
 
 
-void
+__dead2
+static void
 panic_64(x86_saved_state_t *sp, __unused int pc, __unused const char *msg, boolean_t do_mca_dump)
 {
 	/* Set postcode (DEBUG only) */
@@ -171,11 +171,19 @@ panic_64(x86_saved_state_t *sp, __unused int pc, __unused const char *msg, boole
 void
 panic_double_fault64(x86_saved_state_t *sp)
 {
+#if DEVELOPMENT || DEBUG
+	uint64_t frameptr = is_saved_state64(sp) ? saved_state64(sp)->rbp : saved_state32(sp)->ebp;
+	(void) traptrace_start(T_DOUBLE_FAULT, saved_state64(sp)->isf.rip, mach_absolute_time(), frameptr);
+#endif
 	(void)OSCompareAndSwap((UInt32) - 1, (UInt32) cpu_number(), (volatile UInt32 *)&panic_double_fault_cpu);
 	panic_64(sp, PANIC_DOUBLE_FAULT, "Double fault", FALSE);
 }
 void
 panic_machine_check64(x86_saved_state_t *sp)
 {
+#if DEVELOPMENT || DEBUG
+	uint64_t frameptr = is_saved_state64(sp) ? saved_state64(sp)->rbp : saved_state32(sp)->ebp;
+	(void) traptrace_start(T_MACHINE_CHECK, saved_state64(sp)->isf.rip, mach_absolute_time(), frameptr);
+#endif
 	panic_64(sp, PANIC_MACHINE_CHECK, "Machine Check", TRUE);
 }

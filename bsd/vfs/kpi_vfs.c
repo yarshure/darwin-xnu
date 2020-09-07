@@ -719,7 +719,13 @@ vfs_setattr(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
 {
 	int error;
 
-	if (vfs_isrdonly(mp)) {
+	/*
+	 * with a read-only system volume, we need to allow rename of the root volume
+	 * even if it's read-only.  Don't return EROFS here if setattr changes only
+	 * the volume name
+	 */
+	if (vfs_isrdonly(mp) &&
+	    !((mp->mnt_flag & MNT_ROOTFS) && (vfa->f_active == VFSATTR_f_vol_name))) {
 		return EROFS;
 	}
 
@@ -868,7 +874,7 @@ vfs_fsadd(struct vfs_fsentry *vfe, vfstable_t *handle)
 	int     i, j;
 	int(***opv_desc_vector_p)(void *);
 	int(**opv_desc_vector)(void *);
-	struct vnodeopv_entry_desc      *opve_descp;
+	const struct vnodeopv_entry_desc        *opve_descp;
 	int desccount;
 	int descsize;
 	PFI *descptr;
@@ -1325,6 +1331,56 @@ vfs_context_cwd(vfs_context_t ctx)
 }
 
 /*
+ * vfs_context_get_cwd
+ *
+ * Description:	Returns a vnode for the current working	directory for the
+ *              supplied context. The returned vnode has an iocount on it
+ *              which must be released with a vnode_put().
+ *
+ * Parameters:	vfs_context_t			The context to use
+ *
+ * Returns:	vnode_t				The current working directory
+ *						for this context
+ *
+ * Notes:	The function first attempts to obtain the current directory
+ *		from the thread, and if it is not present there, falls back
+ *		to obtaining it from the process instead.  If it can't be
+ *		obtained from either place, we return NULLVP.
+ */
+vnode_t
+vfs_context_get_cwd(vfs_context_t ctx)
+{
+	vnode_t cwd = NULLVP;
+
+	if (ctx != NULL && ctx->vc_thread != NULL) {
+		uthread_t uth = get_bsdthread_info(ctx->vc_thread);
+		proc_t proc;
+
+		/*
+		 * Get the cwd from the thread; if there isn't one, get it
+		 * from the process, instead.
+		 */
+		cwd = uth->uu_cdir;
+
+		if (cwd) {
+			if ((vnode_get(cwd) != 0)) {
+				cwd = NULLVP;
+			}
+		} else if ((proc = (proc_t)get_bsdthreadtask_info(ctx->vc_thread)) != NULL &&
+		    proc->p_fd != NULL) {
+			proc_fdlock(proc);
+			cwd = proc->p_fd->fd_cdir;
+			if (cwd && (vnode_get(cwd) != 0)) {
+				cwd = NULLVP;
+			}
+			proc_fdunlock(proc);
+		}
+	}
+
+	return cwd;
+}
+
+/*
  * vfs_context_create
  *
  * Description: Allocate and initialize a new context.
@@ -1540,6 +1596,19 @@ vnode_mountdevvp(vnode_t vp)
 	}
 }
 #endif
+
+boolean_t
+vnode_isonexternalstorage(vnode_t vp)
+{
+	if (vp) {
+		if (vp->v_mount) {
+			if (vp->v_mount->mnt_ioflags & MNT_IOFLAGS_PERIPHERAL_DRIVE) {
+				return TRUE;
+			}
+		}
+	}
+	return FALSE;
+}
 
 mount_t
 vnode_mountedhere(vnode_t vp)
@@ -2436,6 +2505,8 @@ vnode_getattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
 		VATTR_SET_ACTIVE(vap, va_total_alloc);
 	}
 
+	vap->va_vaflags &= ~VA_USEFSID;
+
 	error = VNOP_GETATTR(vp, vap, ctx);
 	if (error) {
 		KAUTH_DEBUG("ERROR - returning %d", error);
@@ -2476,7 +2547,7 @@ vnode_getattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
 						error = ENOMEM;
 						goto out;
 					}
-					bcopy(&fsec->fsec_acl, facl, KAUTH_ACL_COPYSIZE(&fsec->fsec_acl));
+					__nochk_bcopy(&fsec->fsec_acl, facl, KAUTH_ACL_COPYSIZE(&fsec->fsec_acl));
 					VATTR_RETURN(vap, va_acl, facl);
 				}
 			}
@@ -2627,9 +2698,14 @@ vnode_getattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
 	/*
 	 * The fsid can be obtained from the mountpoint directly.
 	 */
-	VATTR_RETURN(vap, va_fsid, vp->v_mount->mnt_vfsstat.f_fsid.val[0]);
+	if (VATTR_IS_ACTIVE(vap, va_fsid) &&
+	    (!VATTR_IS_SUPPORTED(vap, va_fsid) ||
+	    vap->va_vaflags & VA_REALFSID || !(vap->va_vaflags & VA_USEFSID))) {
+		VATTR_RETURN(vap, va_fsid, vp->v_mount->mnt_vfsstat.f_fsid.val[0]);
+	}
 
 out:
+	vap->va_vaflags &= ~VA_USEFSID;
 
 	return error;
 }
@@ -3815,6 +3891,39 @@ VNOP_REVOKE(vnode_t vp, int flags, vfs_context_t ctx)
 #if 0
 /*
 *#
+*# mmap_check - vp U U U
+*#
+*/
+struct vnop_mmap_check_args {
+	struct vnodeop_desc *a_desc;
+	vnode_t a_vp;
+	int a_flags;
+	vfs_context_t a_context;
+};
+#endif /* 0 */
+errno_t
+VNOP_MMAP_CHECK(vnode_t vp, int flags, vfs_context_t ctx)
+{
+	int _err;
+	struct vnop_mmap_check_args a;
+
+	a.a_desc = &vnop_mmap_check_desc;
+	a.a_vp = vp;
+	a.a_flags = flags;
+	a.a_context = ctx;
+
+	_err = (*vp->v_op[vnop_mmap_check_desc.vdesc_offset])(&a);
+	if (_err == ENOTSUP) {
+		_err = 0;
+	}
+	DTRACE_FSINFO(mmap_check, vnode_t, vp);
+
+	return _err;
+}
+
+#if 0
+/*
+*#
 *# mmap - vp U U U
 *#
 */
@@ -4109,9 +4218,8 @@ vn_rename(struct vnode *fdvp, struct vnode **fvpp, struct componentname *fcnp, s
 		} else {
 			xfromname = &smallname1[0];
 		}
-		strlcpy(xfromname, "._", min(sizeof smallname1, len));
-		strncat(xfromname, fcnp->cn_nameptr, fcnp->cn_namelen);
-		xfromname[len - 1] = '\0';
+		strlcpy(xfromname, "._", len);
+		strlcat(xfromname, fcnp->cn_nameptr, len);
 
 		/* Get destination attribute file name. */
 		len = tcnp->cn_namelen + 3;
@@ -4120,9 +4228,8 @@ vn_rename(struct vnode *fdvp, struct vnode **fvpp, struct componentname *fcnp, s
 		} else {
 			xtoname = &smallname2[0];
 		}
-		strlcpy(xtoname, "._", min(sizeof smallname2, len));
-		strncat(xtoname, tcnp->cn_nameptr, tcnp->cn_namelen);
-		xtoname[len - 1] = '\0';
+		strlcpy(xtoname, "._", len);
+		strlcat(xtoname, tcnp->cn_nameptr, len);
 
 		/*
 		 * Look up source attribute file, keep reference on it if exists.
@@ -4207,6 +4314,9 @@ vn_rename(struct vnode *fdvp, struct vnode **fvpp, struct componentname *fcnp, s
 #if CONFIG_MACF
 	if (_err == 0) {
 		mac_vnode_notify_rename(ctx, *fvpp, tdvp, tcnp);
+		if (flags & VFS_RENAME_SWAP) {
+			mac_vnode_notify_rename(ctx, *tvpp, fdvp, fcnp);
+		}
 	}
 #endif
 
