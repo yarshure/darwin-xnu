@@ -1295,7 +1295,11 @@ init_task_ledgers(void)
 	    task_wakeups_rate_exceeded, NULL, NULL);
 	ledger_set_callback(t, task_ledgers.physical_writes, task_io_rate_exceeded, (void *)FLAVOR_IO_PHYSICAL_WRITES, NULL);
 
+#if XNU_MONITOR
+	ledger_template_complete_secure_alloc(t);
+#else /* XNU_MONITOR */
 	ledger_template_complete(t);
+#endif /* XNU_MONITOR */
 	task_ledger_template = t;
 }
 
@@ -2213,7 +2217,7 @@ task_mark_corpse(task_t task)
 
 	ipc_task_reset(task);
 	/* Remove the naked send right for task port, needed to arm no sender notification */
-	task_set_special_port(task, TASK_KERNEL_PORT, IPC_PORT_NULL);
+	task_set_special_port_internal(task, TASK_KERNEL_PORT, IPC_PORT_NULL);
 	ipc_task_enable(task);
 
 	task_unlock(task);
@@ -4338,7 +4342,6 @@ host_security_set_task_token(
 	task_lock(task);
 	task->sec_token = sec_token;
 	task->audit_token = audit_token;
-
 	task_unlock(task);
 
 	if (host_priv != HOST_PRIV_NULL) {
@@ -4347,7 +4350,8 @@ host_security_set_task_token(
 		kr = host_get_host_port(host_priv_self(), &host_port);
 	}
 	assert(kr == KERN_SUCCESS);
-	kr = task_set_special_port(task, TASK_HOST_PORT, host_port);
+
+	kr = task_set_special_port_internal(task, TASK_HOST_PORT, host_port);
 	return kr;
 }
 
@@ -5540,6 +5544,27 @@ task_energy(
 	return energy;
 }
 
+#if __AMP__
+
+uint64_t
+task_cpu_ptime(
+	task_t  task)
+{
+	uint64_t cpu_ptime = 0;
+	thread_t thread;
+
+	task_lock(task);
+	cpu_ptime += task->total_ptime;
+
+	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+		cpu_ptime += timer_grab(&thread->ptime);
+	}
+
+	task_unlock(task);
+	return cpu_ptime;
+}
+
+#else /* __AMP__ */
 
 uint64_t
 task_cpu_ptime(
@@ -5548,6 +5573,7 @@ task_cpu_ptime(
 	return 0;
 }
 
+#endif /* __AMP__ */
 
 /* This function updates the cpu time in the arrays for each
  * effective and requested QoS class

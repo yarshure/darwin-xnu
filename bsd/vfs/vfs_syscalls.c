@@ -2800,6 +2800,7 @@ quotactl(proc_t p, struct quotactl_args *uap, __unused int32_t *retval)
 		return error;
 	}
 	mp = nd.ni_vp->v_mount;
+	mount_ref(mp, 0);
 	vnode_put(nd.ni_vp);
 	nameidone(&nd);
 
@@ -2874,6 +2875,7 @@ quotactl(proc_t p, struct quotactl_args *uap, __unused int32_t *retval)
 		break;
 	} /* switch */
 
+	mount_drop(mp, 0);
 	return error;
 }
 #else
@@ -4191,7 +4193,7 @@ open_extended(proc_t p, struct open_extended_args *uap, int32_t *retval)
 
 	VATTR_INIT(&va);
 	cmode = ((uap->mode & ~fdp->fd_cmask) & ALLPERMS) & ~S_ISTXT;
-	VATTR_SET(&va, va_mode, cmode);
+	VATTR_SET(&va, va_mode, cmode & ACCESSPERMS);
 	if (uap->uid != KAUTH_UID_NONE) {
 		VATTR_SET(&va, va_uid, uap->uid);
 	}

@@ -2072,7 +2072,8 @@ IOUserClient::_sendAsyncResult64(OSAsyncReference64 reference,
 		replyMsg.m.msg64.notifyHdr.size = sizeof(IOAsyncCompletionContent)
 		    + numArgs * sizeof(io_user_reference_t);
 		replyMsg.m.msg64.notifyHdr.type = kIOAsyncCompletionNotificationType;
-		bcopy(reference, replyMsg.m.msg64.notifyHdr.reference, sizeof(OSAsyncReference64));
+		/* Copy reference except for reference[0], which is left as 0 from the earlier bzero */
+		bcopy(&reference[1], &replyMsg.m.msg64.notifyHdr.reference[1], sizeof(OSAsyncReference64) - sizeof(reference[0]));
 
 		replyMsg.m.msg64.asyncContent.result = result;
 		if (numArgs) {
@@ -2089,7 +2090,8 @@ IOUserClient::_sendAsyncResult64(OSAsyncReference64 reference,
 		    + numArgs * sizeof(uint32_t);
 		replyMsg.m.msg32.notifyHdr.type = kIOAsyncCompletionNotificationType;
 
-		for (idx = 0; idx < kOSAsyncRefCount; idx++) {
+		/* Skip reference[0] which is left as 0 from the earlier bzero */
+		for (idx = 1; idx < kOSAsyncRefCount; idx++) {
 			replyMsg.m.msg32.notifyHdr.reference[idx] = REF32(reference[idx]);
 		}
 
@@ -3548,10 +3550,12 @@ GetPropertiesEditor(void                  * reference,
 
 #endif /* CONFIG_MACF */
 
-/* Routine io_registry_entry_get_properties */
+/* Routine io_registry_entry_get_properties_bin_buf */
 kern_return_t
-is_io_registry_entry_get_properties_bin(
+is_io_registry_entry_get_properties_bin_buf(
 	io_object_t registry_entry,
+	mach_vm_address_t buf,
+	mach_vm_size_t *bufsize,
 	io_buf_ptr_t *properties,
 	mach_msg_type_number_t *propertiesCnt)
 {
@@ -3585,21 +3589,48 @@ is_io_registry_entry_get_properties_bin(
 
 	if (kIOReturnSuccess == err) {
 		len = s->getLength();
-		*propertiesCnt = len;
-		err = copyoutkdata(s->text(), len, properties);
+		if (buf && bufsize && len <= *bufsize) {
+			*bufsize = len;
+			*propertiesCnt = 0;
+			*properties = nullptr;
+			if (copyout(s->text(), buf, len)) {
+				err = kIOReturnVMError;
+			} else {
+				err = kIOReturnSuccess;
+			}
+		} else {
+			if (bufsize) {
+				*bufsize = 0;
+			}
+			*propertiesCnt = len;
+			err = copyoutkdata( s->text(), len, properties );
+		}
 	}
 	s->release();
 
 	return err;
 }
 
-/* Routine io_registry_entry_get_property_bin */
+/* Routine io_registry_entry_get_properties_bin */
 kern_return_t
-is_io_registry_entry_get_property_bin(
+is_io_registry_entry_get_properties_bin(
+	io_object_t registry_entry,
+	io_buf_ptr_t *properties,
+	mach_msg_type_number_t *propertiesCnt)
+{
+	return is_io_registry_entry_get_properties_bin_buf(registry_entry,
+	           0, NULL, properties, propertiesCnt);
+}
+
+/* Routine io_registry_entry_get_property_bin_buf */
+kern_return_t
+is_io_registry_entry_get_property_bin_buf(
 	io_object_t registry_entry,
 	io_name_t plane,
 	io_name_t property_name,
 	uint32_t options,
+	mach_vm_address_t buf,
+	mach_vm_size_t *bufsize,
 	io_buf_ptr_t *properties,
 	mach_msg_type_number_t *propertiesCnt )
 {
@@ -3648,8 +3679,22 @@ is_io_registry_entry_get_property_bin(
 
 	if (obj->serialize( s )) {
 		len = s->getLength();
-		*propertiesCnt = len;
-		err = copyoutkdata( s->text(), len, properties );
+		if (buf && bufsize && len <= *bufsize) {
+			*bufsize = len;
+			*propertiesCnt = 0;
+			*properties = nullptr;
+			if (copyout(s->text(), buf, len)) {
+				err = kIOReturnVMError;
+			} else {
+				err = kIOReturnSuccess;
+			}
+		} else {
+			if (bufsize) {
+				*bufsize = 0;
+			}
+			*propertiesCnt = len;
+			err = copyoutkdata( s->text(), len, properties );
+		}
 	} else {
 		err = kIOReturnUnsupported;
 	}
@@ -3658,6 +3703,20 @@ is_io_registry_entry_get_property_bin(
 	obj->release();
 
 	return err;
+}
+
+/* Routine io_registry_entry_get_property_bin */
+kern_return_t
+is_io_registry_entry_get_property_bin(
+	io_object_t registry_entry,
+	io_name_t plane,
+	io_name_t property_name,
+	uint32_t options,
+	io_buf_ptr_t *properties,
+	mach_msg_type_number_t *propertiesCnt )
+{
+	return is_io_registry_entry_get_property_bin_buf(registry_entry, plane,
+	           property_name, options, 0, NULL, properties, propertiesCnt);
 }
 
 

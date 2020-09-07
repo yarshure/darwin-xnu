@@ -38,6 +38,9 @@ CODESIGN_ALLOCATE:=$(shell xcrun -sdk "$(TARGETSDK)" -find codesign_allocate)
 
 atm_diagnostic_flag: OTHER_CFLAGS += drop_priv.c
 
+atm_diagnostic_flag_entitled: CODE_SIGN_ENTITLEMENTS = atm_diagnostic_flag.entitlements
+atm_diagnostic_flag_entitled: OTHER_CFLAGS += drop_priv.c
+
 testposixshm: INVALID_ARCHS = i386
 
 avx: INVALID_ARCHS = i386
@@ -96,6 +99,10 @@ shared_cache_tests: OTHER_LDFLAGS += -ldarwintest_utils
 stackshot_tests: OTHER_CFLAGS += -Wno-objc-messaging-id
 stackshot_tests: OTHER_LDFLAGS += -lkdd -ldarwintest_utils -framework Foundation
 stackshot_tests: INVALID_ARCHS = i386
+
+stackshot_accuracy: OTHER_CFLAGS += -ldarwintest_utils -Wno-objc-messaging-id
+stackshot_accuracy: OTHER_LDFLAGS += -lkdd -ldarwintest_utils -framework Foundation
+stackshot_accuracy: INVALID_ARCHS = i386
 
 telemetry: OTHER_LDFLAGS = -framework ktrace -framework CoreFoundation
 telemetry: INVALID_ARCHS = i386

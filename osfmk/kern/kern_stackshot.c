@@ -664,7 +664,7 @@ kern_stack_snapshot_internal(int stackshot_config_version, void *stackshot_confi
 	stackshotbuf_size = get_stackshot_estsize(size_hint);
 
 	for (; stackshotbuf_size <= max_tracebuf_size; stackshotbuf_size <<= 1) {
-		if (kmem_alloc(kernel_map, (vm_offset_t *)&stackshotbuf, stackshotbuf_size, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
+		if (kmem_alloc_flags(kernel_map, (vm_offset_t *)&stackshotbuf, stackshotbuf_size, VM_KERN_MEMORY_DIAG, KMA_ZERO) != KERN_SUCCESS) {
 			error = KERN_RESOURCE_SHORTAGE;
 			goto error_exit;
 		}
@@ -2070,7 +2070,7 @@ kdp_stackshot_kcdata_format(int pid, uint32_t trace_flags, uint32_t * pBytesTrac
 		kcd_exit_on_error(kcdata_get_memory_addr(stackshot_kcdata_p, STACKSHOT_KCTYPE_OSVERSION, length_to_copy, &out_addr));
 		stackshot_strlcpy((char*)out_addr, &version[0], length_to_copy);
 
-		length_to_copy =  MIN((uint32_t)(strlen(PE_boot_args()) + 1), OSVERSIZE);
+		length_to_copy =  MIN((uint32_t)(strlen(PE_boot_args()) + 1), BOOT_LINE_LENGTH);
 		kcd_exit_on_error(kcdata_get_memory_addr(stackshot_kcdata_p, STACKSHOT_KCTYPE_BOOTARGS, length_to_copy, &out_addr));
 		stackshot_strlcpy((char*)out_addr, PE_boot_args(), length_to_copy);
 
@@ -2637,6 +2637,7 @@ stackshot_coalition_jetsam_snapshot(void *arg, int i, coalition_t coal)
 	task_t leader = TASK_NULL;
 	jcs->jcs_id = coalition_id(coal);
 	jcs->jcs_flags = 0;
+	jcs->jcs_thread_group = 0;
 
 	if (coalition_term_requested(coal)) {
 		jcs->jcs_flags |= kCoalitionTermRequested;
